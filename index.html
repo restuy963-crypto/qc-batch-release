@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#0f3d5e">
+<title>QC BATCH RELEASE</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<style>
+:root{--bg:#f3f5f7;--card:#fff;--ink:#14212b;--mute:#5b6b78;--line:#d9e0e6;--pri:#0f3d5e;--pri2:#1b5d8c;
+--ok:#1e7a3c;--okbg:#e5f4ea;--warn:#9a5b00;--warnbg:#fff3dc;--bad:#b3261e;--badbg:#fde7e5;--gray:#e9edf1}
+*{box-sizing:border-box}
+html,body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
+header{position:sticky;top:0;z-index:20;background:var(--pri);color:#fff;padding:10px 14px 8px}
+header h1{margin:0;font-size:16px;letter-spacing:.5px}
+.hrow{display:flex;gap:6px;flex-wrap:wrap;margin-top:6px}
+.chip{display:inline-block;font-size:11.5px;font-weight:600;padding:2px 8px;border-radius:99px;background:rgba(255,255,255,.16);color:#fff}
+.chip.ok{background:#2e9e55}.chip.bad{background:#c0392b}.chip.warn{background:#c98a14}
+main{padding:12px 12px 96px;max-width:720px;margin:0 auto}
+h2{font-size:19px;margin:6px 0 2px}.sub{color:var(--mute);margin:0 0 12px;font-size:13.5px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:12px;margin:0 0 12px}
+.card h3{margin:0 0 8px;font-size:12.5px;letter-spacing:.6px;color:var(--mute);text-transform:uppercase}
+.big{font-size:20px;font-weight:700}
+.kv{display:grid;grid-template-columns:auto 1fr;gap:3px 10px;font-size:14px}.kv b{font-weight:600}.kv span{color:var(--mute)}
+button,.btn{appearance:none;border:0;border-radius:10px;padding:12px 14px;font:600 14.5px system-ui,sans-serif;background:var(--pri);color:#fff;cursor:pointer;min-height:46px;display:inline-flex;align-items:center;justify-content:center;gap:6px;text-decoration:none}
+button.sec,.btn.sec{background:var(--gray);color:var(--ink)}
+button.danger{background:var(--bad)}
+button.small{min-height:36px;padding:7px 10px;font-size:13px}
+button:disabled{opacity:.45;cursor:not-allowed}
+.row{display:flex;gap:8px;flex-wrap:wrap}.row>*{flex:1 1 0}
+.full{width:100%}
+label.f{display:block;font-size:12.5px;font-weight:600;color:var(--mute);margin:10px 0 4px}
+input[type=text],input[type=number],input[type=search],input[type=date],select,textarea{width:100%;padding:10px;border:1px solid var(--line);border-radius:8px;font:15px system-ui,sans-serif;background:#fff;color:var(--ink)}
+input.mono{font-family:ui-monospace,Menlo,monospace;letter-spacing:3px;font-size:18px}
+input[readonly]{background:#f2f4f6}
+textarea{min-height:70px}
+.check{display:flex;gap:8px;align-items:flex-start;margin:10px 0;font-size:14px}.check input{width:20px;height:20px;margin-top:1px}
+.badge{display:inline-block;font-size:12px;font-weight:700;padding:2px 8px;border-radius:6px;background:var(--gray);color:var(--ink);white-space:nowrap}
+.b-MATCH,.b-VALID,.b-RELEASE,.b-SELESAI,.b-ok{background:var(--okbg);color:var(--ok)}
+.b-MISMATCH,.b-INVALID,.b-HOLD-TOTAL,.b-GAGAL,.b-bad{background:var(--badbg);color:var(--bad)}
+.b-NOT-READABLE,.b-NOT-VISIBLE,.b-HOLD,.b-PROSES,.b-PERLU-TINJAU,.b-warn{background:var(--warnbg);color:var(--warn)}
+.decision{border-radius:12px;padding:14px;margin-bottom:12px;border:2px solid}
+.decision .big{font-size:26px}
+.d-RELEASE{background:var(--okbg);border-color:var(--ok);color:var(--ok)}
+.d-HOLD{background:var(--warnbg);border-color:var(--warn);color:var(--warn)}
+.d-HOLD-TOTAL{background:var(--badbg);border-color:var(--bad);color:var(--bad)}
+.decision ul{margin:6px 0 0;padding-left:18px;color:var(--ink)}
+.empty{color:var(--mute);text-align:center;padding:18px 8px}
+.msg{padding:10px 12px;border-radius:10px;margin:0 0 12px;font-size:14px}
+.msg.info{background:#e7f0f8;color:#123}.msg.warn{background:var(--warnbg);color:#5a3a00}.msg.bad{background:var(--badbg);color:#6d1510}.msg.ok{background:var(--okbg);color:#0e4523}
+.preview{width:100%;max-height:260px;object-fit:contain;background:#222;border-radius:8px;display:block}
+.photo{display:grid;grid-template-columns:76px 1fr;gap:10px;border-top:1px solid var(--line);padding:10px 0}
+.photo:first-of-type{border-top:0}
+.photo img{width:76px;height:76px;object-fit:cover;border-radius:8px;background:#222}
+.photo .meta{font-size:13px;color:var(--mute);word-break:break-all}
+.stage{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-top:1px solid var(--line);gap:8px}
+.stage:first-of-type{border-top:0}
+.bar{height:6px;background:var(--gray);border-radius:4px;overflow:hidden;margin-top:4px}.bar i{display:block;height:100%;background:var(--pri2);width:0}
+.tbl{width:100%;border-collapse:collapse;font-size:13.5px}.tbl th,.tbl td{border-bottom:1px solid var(--line);padding:6px 4px;text-align:left;vertical-align:top}
+.tbl th{color:var(--mute);font-weight:600;font-size:12px}
+.scroll{overflow-x:auto}
+.digits{display:grid;grid-template-columns:70px repeat(8,1fr);gap:3px;font-family:ui-monospace,Menlo,monospace;text-align:center;font-size:16px}
+.digits div{padding:5px 0;border-radius:5px;background:var(--gray)}
+.digits .lab{background:none;text-align:left;font-family:system-ui;font-size:12px;color:var(--mute);align-self:center}
+.digits .MATCH{background:var(--okbg);color:var(--ok)}.digits .MISMATCH{background:var(--badbg);color:var(--bad);font-weight:700}.digits .NOT-READABLE{background:var(--warnbg);color:var(--warn)}
+nav{position:fixed;bottom:0;left:0;right:0;z-index:20;background:#fff;border-top:1px solid var(--line);display:grid;grid-template-columns:repeat(5,1fr);padding-bottom:env(safe-area-inset-bottom)}
+nav a{display:flex;flex-direction:column;align-items:center;padding:8px 2px 9px;font-size:11.5px;color:var(--mute);text-decoration:none;font-weight:600}
+nav a svg{width:22px;height:22px;margin-bottom:2px;fill:none;stroke:currentColor;stroke-width:2}
+nav a.on{color:var(--pri)}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:50;display:flex;align-items:flex-end;justify-content:center}
+.modal .box{background:#fff;width:100%;max-width:560px;border-radius:16px 16px 0 0;padding:16px;max-height:92vh;overflow:auto}
+.modal h3{margin:0 0 8px}
+.viewer{position:fixed;inset:0;background:#000;z-index:60;display:flex;flex-direction:column}
+.viewer .vbar{display:flex;gap:6px;padding:8px;background:#111}.viewer .vbar button{flex:1}
+.viewer .vimg{flex:1;overflow:auto;touch-action:pan-x pan-y pinch-zoom}
+.viewer img{display:block;transform-origin:0 0}
+.toast{position:fixed;left:12px;right:12px;bottom:84px;z-index:70;padding:12px 14px;border-radius:10px;color:#fff;background:#1d2b36;font-size:14px;box-shadow:0 6px 20px rgba(0,0,0,.25)}
+.toast.bad{background:var(--bad)}.toast.ok{background:var(--ok)}
+.ocrtext{white-space:pre-wrap;font:12px ui-monospace,Menlo,monospace;background:#f6f8fa;border:1px solid var(--line);border-radius:8px;padding:8px;max-height:160px;overflow:auto}
+.hint{font-size:12.5px;color:var(--mute);margin-top:4px}
+details summary{cursor:pointer;font-weight:600;padding:4px 0}
+.hidden{display:none!important}
+.srow{display:flex;justify-content:space-between;gap:8px;align-items:center}
+.itm{border-top:1px solid var(--line);padding:10px 0}.itm:first-of-type{border-top:0}
+.seg{display:flex;flex-wrap:wrap;gap:5px;margin-top:6px}.seg button{flex:1 1 auto;min-height:36px;padding:6px 8px;font-size:12.5px;background:var(--gray);color:var(--ink)}
+.seg button.on{background:var(--pri);color:#fff}
+@media print{header,nav,.noprint,.toast,.modal{display:none!important}main{padding:0}.card{break-inside:avoid}}
+</style>
+</head>
+<body>
+<header>
+  <h1>QC BATCH RELEASE</h1>
+  <div class="hrow"><span id="netChip" class="chip">…</span><span id="refChip" class="chip">…</span><span class="chip">Data di perangkat</span></div>
+</header>
+<main id="view" aria-live="polite"></main>
+<nav id="nav">
+  <a href="#beranda" data-v="beranda"><svg viewBox="0 0 24 24"><path d="M3 11l9-7 9 7v9a1 1 0 0 1-1 1h-5v-6H9v6H4a1 1 0 0 1-1-1z"/></svg>Beranda</a>
+  <a href="#acuan" data-v="acuan"><svg viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/></svg>Acuan</a>
+  <a href="#analisis" data-v="analisis"><svg viewBox="0 0 24 24"><path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/></svg>Analisis</a>
+  <a href="#riwayat" data-v="riwayat"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>Riwayat</a>
+  <a href="#setelan" data-v="setelan"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1.2l2-1.6-2-3.4-2.4 1a7 7 0 0 0-2-1.2L14 3h-4l-.5 2.6a7 7 0 0 0-2 1.2l-2.4-1-2 3.4 2 1.6A7 7 0 0 0 5 12c0 .4 0 .8.1 1.2l-2 1.6 2 3.4 2.4-1a7 7 0 0 0 2 1.2L10 21h4l.5-2.6a7 7 0 0 0 2-1.2l2.4 1 2-3.4-2-1.6c.1-.4.1-.8.1-1.2z"/></svg>Setelan</a>
+</nav>
+<input type="file" id="pickGallery" accept="image/*" class="hidden">
+<input type="file" id="pickGalleryMulti" accept="image/*" multiple class="hidden">
+<input type="file" id="pickCamera" accept="image/*" capture="environment" class="hidden">
+<script type="module" src="src/app.js"></script>
+</body>
+</html>
