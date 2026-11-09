@@ -2,12 +2,12 @@
 
 Aplikasi web bantu inspeksi QC sebelum Batch Release. Dibuat untuk Chrome di Android.
 
-- Semua proses berjalan **di perangkat**. Foto tidak dikirim ke server atau AI eksternal.
-- OCR: Tesseract.js (open-source), dimuat dari cdn.jsdelivr.net, lalu disimpan di cache.
-- Keputusan RELEASE / HOLD / HOLD TOTAL dihitung oleh aturan tetap di `src/qc-core.js`.
-- Data (acuan, sesi, riwayat) tersimpan di IndexedDB browser. Gunakan menu Setelan untuk ekspor dan pulihkan cadangan.
-- Petugas QC memegang otoritas persetujuan akhir.
+## Arsitektur
+- **Frontend** (folder root): GitHub Pages. Data acuan, sesi, dan riwayat disimpan di IndexedDB browser.
+- **Server AI** (`worker/`): Cloudflare Worker. Server ini menyimpan `ANTHROPIC_API_KEY` dan `APP_PASSCODE` sebagai *secret*, lalu memanggil Claude untuk **membaca** gambar. Foto tidak disimpan di server.
+- **Keputusan** RELEASE / HOLD / HOLD TOTAL dihitung oleh aturan tetap di `src/qc-core.js`, bukan oleh AI.
+- Setiap foto dibaca AI 2x secara independen. Hasil yang tidak konsisten atau berisi digit `?` menghasilkan HOLD. Nomor batch acuan tidak dikirim ke AI.
 
 ## Uji
-- Logika inti: `node --test test/qc-core.test.js`
-- Alur lengkap (Playwright + Tesseract CLI): `python3 e2e/run.py` (path foto sampel perlu disesuaikan)
+- `node --test test/qc-core.test.js test/worker.test.js`
+- `python3 e2e/run.py`: menguji alur lengkap di Chrome (Playwright). Panggilan Anthropic ditiru oleh `e2e/mock-server.mjs`.

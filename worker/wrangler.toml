@@ -1,0 +1,15 @@
+# Server AI QC BATCH RELEASE (Cloudflare Workers).
+# Secret WAJIB diisi di dashboard Cloudflare (Settings → Variables and Secrets), JANGAN ditulis di file ini:
+#   ANTHROPIC_API_KEY  = API key dari console Anthropic
+#   APP_PASSCODE       = kode akses aplikasi (bebas, minimal 8 karakter)
+name = "qc-batch-release-api"
+main = "src/index.js"
+compatibility_date = "2026-11-01"
+keep_vars = true
+
+[vars]
+MODEL = "claude-sonnet-5-5"
+ALLOWED_ORIGINS = "https://restuy963-crypto.github.io,http://localhost:8765"
+# Harga per 1 juta token (USD) untuk estimasi biaya. Sesuaikan bila harga berubah.
+PRICE_IN_PER_MTOK = "2"
+PRICE_OUT_PER_MTOK = "10"

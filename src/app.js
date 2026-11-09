@@ -1,12 +1,13 @@
-import { STATUS, DECISION, validateBatch, compareBatch, reconcileReadings, decide, aggregateBatch,
-  findBatchCandidates, parseReferenceText, textContains } from './qc-core.js';
+import { STATUS, DECISION, validateBatch, compareBatch, reconcileReadings, decide, aggregateBatch } from './qc-core.js';
 import { db } from './db.js';
-import { recognize } from './ocr.js';
+import { readReference, readPhoto, health, aiConfigured, getPasscode, setPasscode, apiBase } from './ai.js';
 
-const APP_VERSION = '0.1.0';
+const APP_VERSION = '0.2.0';
 const MAX_FILE = 15 * 1024 * 1024;
 const OK_TYPES = ['image/jpeg', 'image/png', 'image/webp'];
 const CATEGORIES = ['', 'Emboss', 'Label', 'Karton', 'Printer', 'Lainnya'];
+const AI_KEYS = { identity: { nama: 'nama', varian: 'varian', apiJaso: 'api_jaso', volume: 'volume', kemasan: 'kemasan' } };
+const S_ai = { status: 'unknown', model: '', price: null, error: '' };
 const ALL_STATUS = [STATUS.MATCH, STATUS.MISMATCH, STATUS.NOT_READABLE, STATUS.NOT_VISIBLE, STATUS.NOT_APPLICABLE];
 const IDENTITY = [
   { key: 'nama', name: 'Nama produk / brand', ref: r => [r.fields.brand, r.fields.produk].filter(Boolean).join(' ') },
@@ -119,6 +120,19 @@ async function prepareImage(file) {
   return item;
 }
 
+// Catat pemakaian AI (token & estimasi biaya) untuk transparansi.
+async function addUsage(u, session) {
+  if (!u) return;
+  const t = (await db.kvGet('usageTotal')) || { input_tokens: 0, output_tokens: 0, cost_usd: 0, calls: 0 };
+  t.input_tokens += u.input_tokens || 0; t.output_tokens += u.output_tokens || 0; t.cost_usd += u.cost_usd || 0; t.calls += 1;
+  await db.kvSet('usageTotal', t);
+  if (session) {
+    const x = session.usage || (session.usage = { input_tokens: 0, output_tokens: 0, cost_usd: 0, calls: 0 });
+    x.input_tokens += u.input_tokens || 0; x.output_tokens += u.output_tokens || 0; x.cost_usd += u.cost_usd || 0; x.calls += 1;
+  }
+}
+const fmtCost = usd => `$${(usd || 0).toFixed(4)} (± Rp${Math.round((usd || 0) * 16500).toLocaleString('id-ID')})`;
+
 // ---------------- data loading ----------------
 async function loadState() {
   const refId = await db.kvGet('activeRefId');
@@ -138,7 +152,19 @@ function updateHeader() {
   const rc = document.getElementById('refChip');
   rc.textContent = S.ref ? `ACUAN: TERKUNCI • ${S.ref.fields.batch}` : 'ACUAN: BELUM ADA';
   rc.className = 'chip ' + (S.ref ? 'ok' : 'warn');
+  const ac = document.getElementById('aiChip');
+  if (ac) {
+    const st = !aiConfigured() ? ['AI: BELUM DIATUR', 'warn'] : S_ai.status === 'ok' ? ['AI: AKTIF', 'ok'] : S_ai.status === 'error' ? ['AI: GAGAL', 'bad'] : ['AI: …', ''];
+    ac.textContent = st[0]; ac.className = 'chip ' + st[1];
+  }
 }
+async function checkAi() {
+  if (!aiConfigured()) { S_ai.status = 'unknown'; updateHeader(); return; }
+  try { const h = await health(); Object.assign(S_ai, { status: 'ok', model: h.model, price: h.price, error: '' }); }
+  catch (e) { Object.assign(S_ai, { status: 'error', error: e.message }); }
+  updateHeader();
+}
+addEventListener('online', checkAi);
 addEventListener('online', updateHeader); addEventListener('offline', updateHeader);
 
 // ---------------- router ----------------
@@ -234,18 +260,18 @@ routes.acuan = async () => {
   </div>
   ${d.image ? `
   <div class="card"><h3>Hasil ekstraksi</h3>
-    ${d.ocrDone ? `<div class="msg info">Isian di bawah adalah <b>usulan OCR</b>. Cocokkan setiap field dengan gambar. Koreksi bila perlu. Jangan mengisi yang tidak terbaca.</div>`
-      : `<div class="msg warn">Tekan <b>BACA DATA ACUAN</b> untuk pembacaan otomatis, atau isi manual sesuai gambar.</div>`}
+    ${d.ocrDone ? `<div class="msg info">Isian di bawah adalah <b>hasil baca AI</b>${d.aiModel ? ' (' + esc(d.aiModel) + ')' : ''}. Cocokkan setiap field dengan gambar. Koreksi bila perlu. Jangan mengisi yang tidak terbaca.</div>`
+      : `<div class="msg warn">Tekan <b>BACA DATA ACUAN</b> agar AI membaca tabel, atau isi manual sesuai gambar.</div>`}
     <label class="f">Batch Filling (tepat 8 digit) *</label>
     <input type="text" class="mono" inputmode="numeric" maxlength="8" autocomplete="off" data-ref="batch" value="${esc(d.fields.batch)}" ${d.unreadable.batch ? 'disabled' : ''}>
     <label class="check"><input type="checkbox" data-unr="batch" ${d.unreadable.batch ? 'checked' : ''}> Tidak terbaca</label>
-    ${d.candidates.length > 1 && !d.blending ? `<div class="hint">Kandidat 8 digit dari OCR: ${d.candidates.map(c => `<button class="small sec" data-act="refCand" data-v="${esc(c)}">${esc(c)}</button>`).join(' ')}</div>` : ''}
+    ${d.candidates.length > 1 && !d.blending ? `<div class="hint">Kandidat 8 digit: ${d.candidates.map(c => `<button class="small sec" data-act="refCand" data-v="${esc(c)}">${esc(c)}</button>`).join(' ')}</div>` : ''}
     ${d.blending ? `<div class="hint">Batch Blending terdeteksi (${esc(d.blending)}) — <b>diabaikan</b>, tidak dipakai untuk pemeriksaan.</div>` : ''}
     ${REF_FIELDS.map(f => `<label class="f">${esc(f.label)}${f.required ? ' *' : ''}</label>
       ${f.key === 'catatan' ? `<textarea data-ref="catatan" ${d.unreadable.catatan ? 'disabled' : ''}>${esc(d.fields.catatan)}</textarea>`
         : `<input type="text" data-ref="${f.key}" value="${esc(d.fields[f.key])}" ${d.unreadable[f.key] ? 'disabled' : ''}>`}
       <label class="check"><input type="checkbox" data-unr="${f.key}" ${d.unreadable[f.key] ? 'checked' : ''}> ${f.key === 'catatan' ? 'Tidak ada / tidak terbaca' : 'Tidak terbaca / tidak tercantum'}</label>`).join('')}
-    ${d.ocrText ? `<details><summary>Teks mentah OCR</summary><div class="ocrtext">${esc(d.ocrText)}</div></details>` : ''}
+    ${d.ocrText ? `<details><summary>Data mentah hasil AI</summary><div class="ocrtext">${esc(d.ocrText)}</div></details>` : ''}
   </div>
   <div class="card"><h3>Validasi</h3><div id="refVal"></div>
     <label class="check"><input type="checkbox" id="refConfirm" ${d.confirmed ? 'checked' : ''}> Saya sudah mencocokkan setiap field dengan gambar DATA ACUAN.</label>
@@ -306,23 +332,28 @@ actions.refView = () => viewer(S.draft.image, 'DATA ACUAN');
 actions.refCand = b => { S.draft.fields.batch = b.dataset.v; S.draft.unreadable.batch = false; S.draft.confirmed = false; saveDraft(); render(); };
 actions.refOcr = async b => {
   if (S.busy) return;
-  if (!navigator.onLine && !window.__OCR_MOCK) toast('Offline: OCR hanya berjalan bila modulnya sudah pernah diunduh.', '');
+  if (!aiConfigured()) { toast('AI belum diatur. Buka Setelan dan isi kode akses.', 'bad'); return; }
+  if (!await modal({ title: 'Kirim gambar acuan ke AI?', ok: 'Kirim & baca', body: '<p>Gambar DATA ACUAN dikirim ke Claude (Anthropic) melalui server aplikasi untuk dibaca. Server aplikasi tidak menyimpan gambar.</p>' })) return;
   S.busy = true; b.disabled = true;
   const prog = document.getElementById('ocrProg'); prog.classList.remove('hidden');
-  const bar = prog.querySelector('i'); const msg = document.getElementById('ocrMsg');
-  msg.textContent = 'Memuat modul OCR & membaca gambar…';
+  const bar = prog.querySelector('i'); bar.style.width = '35%';
+  document.getElementById('ocrMsg').textContent = 'AI sedang membaca tabel… (10–40 detik)';
   try {
-    const { text } = await recognize(S.draft.image, p => { bar.style.width = Math.round(p * 100) + '%'; msg.textContent = `Membaca… ${Math.round(p * 100)}%`; });
-    const p = parseReferenceText(text);
-    const d = S.draft;
-    d.ocrText = text; d.ocrDone = true; d.blending = p.blending; d.ambiguous = p.ambiguous; d.candidates = [...new Set(p.candidates)];
+    const res = await readReference(S.draft.image);
+    const a = res.data || {}; const d = S.draft;
+    const unr = new Set((a.tidak_terbaca || []).map(x => String(x).toLowerCase()));
+    d.ocrText = JSON.stringify(a, null, 1); d.ocrDone = true; d.aiModel = res.model; d.aiUsage = res.usage;
+    d.blending = a.batch_blending || ''; d.ambiguous = [...(a.ambigu || [])]; d.candidates = [];
+    if ((a.jumlah_baris_data || 0) > 1) d.ambiguous.unshift(`Tabel berisi ${a.jumlah_baris_data} baris data — pastikan baris yang benar`);
     d.unreadable = {}; d.confirmed = false;
-    Object.assign(d.fields, { batch: p.batch, varian: p.varian, apiJaso: p.apiJaso, volume: p.volume, kemasan: p.kemasan, catatan: p.catatan });
-    if (!d.fields.produk) d.ambiguous.push('Nama produk tidak diisi otomatis — ketik sesuai gambar');
+    Object.assign(d.fields, { produk: a.produk || '', brand: a.brand || '', varian: a.varian || '', apiJaso: a.api_jaso || '', volume: a.volume || '', kemasan: a.kemasan || '', batch: (a.batch_filling || '').replace(/\s/g, ''), catatan: a.catatan || '' });
+    if ([...unr].some(x => x.includes('batch'))) d.ambiguous.push('AI menyatakan Batch Filling tidak terbaca pasti');
+    if (d.fields.batch.includes('?')) d.ambiguous.push('Batch Filling mengandung digit tidak terbaca (?) — ambil gambar acuan yang lebih jelas');
     await saveDraft();
-    toast('Pembacaan selesai. Periksa setiap field.', 'ok');
+    await addUsage(res.usage);
+    toast('AI selesai membaca. Periksa setiap field.', 'ok');
   } catch (e) {
-    toast('OCR gagal: ' + e.message + ' Anda tetap bisa mengisi manual sesuai gambar.', 'bad');
+    toast('Gagal membaca: ' + e.message + ' Coba lagi, atau isi manual sesuai gambar.', 'bad');
   } finally { S.busy = false; render(); }
 };
 actions.refReset = async () => {
@@ -338,7 +369,7 @@ actions.refLock = async () => {
   if (!ok) return;
   const now = new Date();
   const ref = { id: 'REF-' + stamp(now), lockedAt: now.toISOString(), status: 'locked', image: d.image, imageName: d.imageName,
-    fields: { ...f }, unreadable: { ...d.unreadable }, ocrText: d.ocrText, blendingIgnored: d.blending, ambiguous: [...d.ambiguous] };
+    fields: { ...f }, unreadable: { ...d.unreadable }, aiRaw: d.ocrText, aiModel: d.aiModel || '', blendingIgnored: d.blending, ambiguous: [...d.ambiguous] };
   await db.put('refs', ref); await db.kvSet('activeRefId', ref.id);
   await db.audit('ACUAN_DIKUNCI', { id: ref.id, batch: f.batch });
   S.ref = ref; S.draft = null; await db.kvSet('draftRef', null);
@@ -390,7 +421,7 @@ function newSession() {
     photos: [], nextNo: 1, stages: null, verification: null, result: null };
 }
 function sessionRefMismatch() { return S.session && S.ref && S.session.refId !== S.ref.id; }
-function resetAnalysis(s) { s.stages = null; s.result = null; s.photos.forEach(p => { p.ocr = null; }); }
+function resetAnalysis(s) { s.stages = null; s.result = null; s.photos.forEach(p => { p.ai = null; p.aiCategory = ''; }); s.verification = null; }
 
 routes.analisis = async () => {
   if (!S.ref) {
@@ -404,20 +435,19 @@ routes.analisis = async () => {
   const s = S.session; const photos = s ? s.photos : [];
   const total = photos.reduce((a, p) => a + p.size, 0);
   const bad = photos.filter(p => p.status !== 'Siap');
-  const uncategorized = photos.filter(p => p.status === 'Siap' && !p.category);
-  const canRun = photos.length > 0 && !bad.length && !uncategorized.length;
+  const canRun = photos.length > 0 && !bad.length && aiConfigured();
   view.innerHTML = `
   <h2>Upload Foto Aktual</h2><p class="sub">Tambahkan foto untuk satu sesi QC${s ? ` • <b>${esc(s.id)}</b>` : ''}</p>
   <div class="card"><h3>Tambahkan foto</h3>
     <div class="row"><button data-act="addPhotos" data-k="multi">GALERI</button><button data-act="addPhotos" data-k="camera">KAMERA</button></div>
-    <p class="hint">Pilih beberapa foto sekaligus. JPG/PNG/WEBP, maks ${fmtSize(MAX_FILE)} per foto. Untuk emboss, foto dari dekat dengan cahaya miring.</p>
+    <p class="hint">Pilih beberapa foto sekaligus. JPG/PNG/WEBP, maks ${fmtSize(MAX_FILE)} per foto. Untuk emboss, foto dari dekat dengan cahaya miring. Kategori dideteksi AI; Anda boleh mengoreksi.</p>
   </div>
   <div class="card"><h3>Daftar foto (${photos.length})</h3>
     ${photos.length ? photos.map((p, i) => `<div class="photo">
       ${p.blob ? `<img src="${url(p.blob)}" alt="" data-act="viewPhoto" data-i="${i}">` : `<div style="width:76px;height:76px;border-radius:8px;background:var(--gray)"></div>`}
       <div><div class="srow"><b>${photoNo(p.no)}</b>${badge(p.status === 'Siap' ? 'Siap' : p.status)}</div>
         <div class="meta">${esc(p.name)} • ${fmtSize(p.size)}</div>
-        <select data-cat="${i}" style="margin-top:6px" ${p.status !== 'Siap' ? 'disabled' : ''}>${CATEGORIES.map(c => `<option value="${c}" ${p.category === c ? 'selected' : ''}>${c || '— Belum diklasifikasi —'}</option>`).join('')}</select>
+        <select data-cat="${i}" style="margin-top:6px" ${p.status !== 'Siap' ? 'disabled' : ''}>${CATEGORIES.map(c => `<option value="${c}" ${p.category === c ? 'selected' : ''}>${c || '— Kategori otomatis (AI) —'}</option>`).join('')}</select>
         <div class="row" style="margin-top:6px"><button class="small sec" data-act="viewPhoto" data-i="${i}" ${p.blob ? '' : 'disabled'}>LIHAT</button><button class="small sec" data-act="replacePhoto" data-i="${i}">GANTI</button><button class="small sec" data-act="delPhoto" data-i="${i}">HAPUS</button></div>
       </div></div>`).join('')
     : `<div class="empty">Belum ada foto aktual. Tekan GALERI atau KAMERA untuk menambahkan.</div>`}
@@ -426,7 +456,7 @@ routes.analisis = async () => {
     <div class="kv"><span>Jumlah foto</span><b>${photos.length}</b><span>Total ukuran</span><b>${fmtSize(total || 0)}</b>
       <span>DATA ACUAN</span><b>TERKUNCI • ${esc(S.ref.fields.batch)}</b></div>
     ${bad.length ? `<div class="msg bad" style="margin-top:8px">${bad.length} foto bermasalah (${[...new Set(bad.map(p => p.status))].join(', ')}). Ganti atau hapus dulu.</div>` : ''}
-    ${uncategorized.length ? `<div class="msg warn" style="margin-top:8px">Pilih kategori untuk: ${uncategorized.map(p => photoNo(p.no)).join(', ')}.</div>` : ''}
+    ${!aiConfigured() ? `<div class="msg warn" style="margin-top:8px">AI belum diatur. Buka <a href="#setelan">Setelan</a> dan isi kode akses.</div>` : ''}
     ${!photos.length ? `<div class="msg warn" style="margin-top:8px">Minimal satu foto aktual diperlukan.</div>` : ''}
     <button class="full" style="margin-top:10px" data-act="startAnalysis" ${canRun ? '' : 'disabled'}>ANALISIS FOTO AKTUAL</button>
     ${s && s.stages ? `<button class="full sec" style="margin-top:8px" data-act="goto" data-h="${s.result ? 'hasil' : 'proses'}">LIHAT PROSES / HASIL TERAKHIR</button>` : ''}
@@ -464,128 +494,181 @@ actions.delPhoto = async b => {
   S.session.photos.splice(i, 1); resetAnalysis(S.session); await saveSession(); render();
 };
 actions.startAnalysis = async () => {
-  const ok = await modal({ title: 'Pemberitahuan privasi', ok: 'Mulai analisis',
-    body: `<p>Foto diproses <b>hanya di perangkat ini</b> dan <b>tidak dikirim</b> ke server atau layanan AI eksternal.</p>
-      <p class="hint">Saat pertama kali, aplikasi mengunduh modul pembaca teks (OCR Tesseract, open-source) dari cdn.jsdelivr.net. Yang diunduh hanya kode program, bukan foto Anda.</p>` });
+  const s = S.session; const n = s.photos.length;
+  const ok = await modal({ title: 'Pemberitahuan privasi & biaya', ok: 'Mulai analisis',
+    body: `<p><b>${n} foto</b> akan dikirim ke <b>Claude (Anthropic)</b> melalui server aplikasi untuk dibaca. Setiap foto dibaca <b>2 kali</b> (double check), jadi ada ${n * 2} permintaan AI.</p>
+      <p class="hint">Server aplikasi tidak menyimpan foto. API key tersimpan aman di server, tidak di HP. Biaya pemakaian dicatat dan ditampilkan di hasil.</p>` });
   if (!ok) return;
-  const s = S.session;
-  s.stages = STAGES.map(n => ({ name: n, status: 'MENUNGGU', note: '' }));
-  s.photos.forEach(p => { p.ocr = { status: 'menunggu' }; });
-  s.result = null; s.verification = s.verification || emptyVerification(s);
+  s.stages = STAGES.map(x => ({ name: x, status: 'MENUNGGU', note: '' }));
+  s.photos.forEach(p => { p.ai = { status: 'menunggu' }; });
+  s.result = null; s.verification = emptyVerification(s);
   await saveSession(); go('proses');
   runPipeline();
 };
 
 // ================= PROSES =================
 const STAGES = ['Validasi referensi', 'Klasifikasi gambar', 'Pembacaan batch', 'Identitas produk', 'Pemeriksaan visual', 'Double check', 'Susun laporan'];
-const ocrDone = s => !!(s && s.stages && s.photos.length && s.photos.every(p => p.ocr && p.ocr.status === 'selesai') && s.stages[0].status === 'SELESAI' && s.stages[1].status === 'SELESAI');
 function setStage(i, status, note = '') { S.session.stages[i].status = status; S.session.stages[i].note = note; }
+const aiDone = s => !!(s && s.stages && s.photos.length && s.photos.every(p => p.ai && p.ai.status === 'selesai'));
+const aiFinished = s => !!(s && s.stages && s.photos.length && s.photos.every(p => p.ai && ['selesai', 'gagal'].includes(p.ai.status)));
+
+async function analyzePhoto(s, p) {
+  const ref = s.refSnapshot.fields;
+  const refForAi = { produk: ref.produk, brand: ref.brand, varian: ref.varian, apiJaso: ref.apiJaso, volume: ref.volume, kemasan: ref.kemasan }; // tanpa nomor batch
+  p.ai = { status: 'diproses' }; refreshProses();
+  try {
+    const [r1, r2] = await Promise.all([readPhoto(p.blob, refForAi, 1), readPhoto(p.blob, refForAi, 2)]);
+    p.ai = { status: 'selesai', read1: r1.data, read2: r2.data, model: r1.model, at: new Date().toISOString() };
+    await addUsage(r1.usage, s); await addUsage(r2.usage, s);
+  } catch (e) { p.ai = { status: 'gagal', error: e.message }; }
+  await saveSession(); refreshProses();
+}
 
 async function runPipeline(onlyFailed = false) {
   const s = S.session; if (!s || S.busy) return;
   S.busy = true;
   try {
-    // 1. Validasi referensi
     const refOk = S.ref && S.ref.id === s.refId && validateBatch(S.ref.fields.batch).valid;
     setStage(0, refOk ? 'SELESAI' : 'GAGAL', refOk ? S.ref.id : 'Acuan tidak aktif / tidak valid');
     await saveSession(); refreshProses();
     if (!refOk) return;
-    // 2. Klasifikasi (ditetapkan petugas)
-    const unc = s.photos.filter(p => !p.category || p.status !== 'Siap');
-    setStage(1, unc.length ? 'GAGAL' : 'SELESAI', unc.length ? 'Ada foto belum diklasifikasi/bermasalah' : 'Kategori ditetapkan petugas');
+    for (let i = 1; i <= 4; i++) setStage(i, 'PROSES');
     await saveSession(); refreshProses();
-    if (unc.length) return;
-    // 3. Pembacaan batch otomatis (OCR) per foto
-    setStage(2, 'PROSES', 'OCR di perangkat'); await saveSession(); refreshProses();
     for (const p of s.photos) {
-      if (onlyFailed && p.ocr && p.ocr.status === 'selesai') continue;
-      p.ocr = { status: 'diproses', progress: 0 }; refreshProses();
-      try {
-        const r = await recognize(p.blob, pr => { p.ocr.progress = pr; refreshProses(true); });
-        p.ocr = { status: 'selesai', text: r.text, confidence: r.confidence, candidates: findBatchCandidates(r.text) };
-      } catch (e) { p.ocr = { status: 'gagal', error: e.message }; }
-      await saveSession(); refreshProses();
+      if (onlyFailed && p.ai && p.ai.status === 'selesai') continue;
+      await analyzePhoto(s, p);
     }
-    const failed = s.photos.filter(p => p.ocr.status === 'gagal');
-    if (failed.length) {
-      setStage(2, 'GAGAL', `${failed.length} foto gagal dibaca: ${failed[0].ocr.error}`);
-    } else {
-      setStage(2, 'PERLU VERIFIKASI', 'Menunggu pembacaan petugas');
-      setStage(3, 'PERLU VERIFIKASI'); setStage(4, 'PERLU VERIFIKASI');
-    }
-    await saveSession(); refreshProses();
+    const failed = s.photos.filter(p => p.ai.status === 'gagal');
+    const st = failed.length ? 'GAGAL' : 'SELESAI';
+    const note = failed.length ? `${failed.length} foto gagal: ${failed[0].ai.error}` : '';
+    setStage(1, st, note || 'Kategori dari AI (koreksi petugas diutamakan)');
+    setStage(2, st, note); setStage(3, st, note); setStage(4, st, note);
+    if (!failed.length) { fillVerificationFromAi(s); finalizeResult(s); }
+    await saveSession();
+    if (!failed.length) { await db.audit('ANALISIS_AI_SELESAI', { id: s.id, decision: s.result.decision, cost_usd: s.usage && s.usage.cost_usd }); if (location.hash === '#proses') go('hasil'); }
   } finally { S.busy = false; refreshProses(); }
 }
 
 routes.proses = async () => {
   const s = S.session;
   if (!s || !s.stages) { view.innerHTML = `<h2>Analisis</h2><div class="empty">Belum ada analisis berjalan.</div><button class="full" data-act="goto" data-h="analisis">KE UPLOAD FOTO</button>`; return; }
-  view.innerHTML = `<h2>Proses Analisis</h2><p class="sub">${esc(s.id)} • status berdasarkan proses nyata di perangkat</p><div id="proc"></div>`;
+  view.innerHTML = `<h2>Analisis Berjalan</h2><p class="sub">${esc(s.id)} • status berdasarkan respons server AI</p><div id="proc"></div>`;
   refreshProses();
 };
-function refreshProses(progressOnly = false) {
+function refreshProses() {
   const box = document.getElementById('proc'); const s = S.session; if (!box || !s || !s.stages) return;
-  if (progressOnly) { s.photos.forEach(p => { const el = document.getElementById('pp' + p.no); if (el && p.ocr) el.style.width = Math.round((p.ocr.progress || 0) * 100) + '%'; }); return; }
-  const st = s.stages; const failed = s.photos.filter(p => p.ocr && p.ocr.status === 'gagal');
-  const readyVerify = ocrDone(s);
+  const st = s.stages; const failed = s.photos.filter(p => p.ai && p.ai.status === 'gagal');
+  const lbl = { menunggu: 'MENUNGGU', diproses: 'PROSES', selesai: 'SELESAI', gagal: 'GAGAL' };
   box.innerHTML = `
   <div class="card"><h3>Tahap analisis</h3>${st.map((x, i) => `<div class="stage"><div><b>${i + 1}. ${esc(x.name)}</b>${x.note ? `<div class="hint">${esc(x.note)}</div>` : ''}</div>${badge(x.status)}</div>`).join('')}</div>
-  <div class="card"><h3>Status foto</h3>${s.photos.map(p => `<div class="stage"><div style="flex:1"><b>${photoNo(p.no)}</b> <span class="hint">${esc(p.category)}</span>
-     ${p.ocr && p.ocr.status === 'diproses' ? `<div class="bar"><i id="pp${p.no}" style="width:${Math.round((p.ocr.progress || 0) * 100)}%"></i></div>` : ''}
-     ${p.ocr && p.ocr.status === 'gagal' ? `<div class="hint" style="color:var(--bad)">${esc(p.ocr.error)}</div>` : ''}
-     ${p.ocr && p.ocr.status === 'selesai' ? `<div class="hint">OCR: ${p.ocr.candidates.length ? p.ocr.candidates.length + ' kandidat 8 digit' : 'tidak menemukan angka 8 digit'}</div>` : ''}
-     </div>${badge(p.ocr ? p.ocr.status.toUpperCase() : 'MENUNGGU')}</div>`).join('')}</div>
+  <div class="card"><h3>Status foto</h3>${s.photos.map(p => `<div class="stage"><div style="flex:1"><b>${photoNo(p.no)}</b> <span class="hint">${esc(p.category || (p.ai && p.ai.read1 && p.ai.read1.kategori) || '')}</span>
+     ${p.ai && p.ai.status === 'diproses' ? '<div class="hint">AI membaca 2x… (biasanya 10–40 detik)</div>' : ''}
+     ${p.ai && p.ai.status === 'gagal' ? `<div class="hint" style="color:var(--bad)">${esc(p.ai.error)}</div>` : ''}
+     ${p.ai && p.ai.status === 'selesai' ? `<div class="hint">Batch terbaca: ${esc(((p.ai.read1.batch_kemunculan || []).map(x => x.teks).join(', ')) || 'tidak ada')}</div>` : ''}
+     </div>${badge(p.ai ? lbl[p.ai.status] || p.ai.status : 'MENUNGGU')}</div>`).join('')}</div>
   <div class="card"><h3>Pesan sistem</h3>
     ${s.result ? `<div class="msg info">Laporan sudah disusun.</div><button class="full" data-act="goto" data-h="hasil">LIHAT HASIL QC</button>`
-      : `<div class="msg warn">Belum ada keputusan final. RELEASE tidak ditampilkan sebelum seluruh tahap selesai.</div>`}
-    ${failed.length && !S.busy ? `<div class="msg bad">${failed.length} foto gagal diproses. Pemeriksaan TIDAK lengkap.${navigator.onLine ? '' : ' Perangkat offline.'}</div>
-      <button class="full" data-act="retryOcr">COBA LAGI</button>` : ''}
-    ${readyVerify && !S.busy && !s.result ? `<button class="full" data-act="goto" data-h="verifikasi">LANJUT: VERIFIKASI PETUGAS</button>` : ''}
-    ${st[0].status === 'GAGAL' || st[1].status === 'GAGAL' ? `<button class="full sec" data-act="goto" data-h="analisis">KEMBALI KE UPLOAD</button>` : ''}
+      : `<div class="msg warn">Belum ada keputusan final. Jangan anggap RELEASE sebelum seluruh tahap selesai.</div>`}
+    ${failed.length && !S.busy ? `<div class="msg bad">${failed.length} foto gagal dianalisis. Pemeriksaan TIDAK lengkap.${navigator.onLine ? '' : ' Perangkat offline.'}</div>
+      <button class="full" data-act="retryAi">COBA LAGI</button>
+      <button class="full sec" style="margin-top:8px" data-act="reportWithFailed">SUSUN LAPORAN APA ADANYA (pasti bukan RELEASE)</button>` : ''}
+    ${st[0].status === 'GAGAL' ? `<button class="full sec" data-act="goto" data-h="analisis">KEMBALI KE UPLOAD</button>` : ''}
   </div>`;
 }
-actions.retryOcr = () => runPipeline(true);
+actions.retryAi = () => runPipeline(true);
+actions.reportWithFailed = async () => {
+  const s = S.session; fillVerificationFromAi(s); finalizeResult(s); await saveSession();
+  await db.audit('LAPORAN_DENGAN_FOTO_GAGAL', { id: s.id, decision: s.result.decision }); go('hasil');
+};
 
-// ================= VERIFIKASI PETUGAS =================
+// ================= ISI DARI AI & TINJAU PETUGAS =================
 function emptyVerification(s) {
   return { photos: {}, identity: Object.fromEntries(IDENTITY.map(x => [x.key, { status: '', photo: '', note: '' }])),
-    visual: Object.fromEntries(VISUAL.map(x => [x.key, { status: '', critical: true, photo: '', note: '' }])), officer: '', followUp: '' };
+    visual: Object.fromEntries(VISUAL.map(x => [x.key, { status: '', critical: true, photo: '', note: '' }])), officer: '', followUp: '', edits: [] };
 }
-function pv(s, no) { const v = s.verification.photos; if (!v[no]) v[no] = { mode: '', r1: '', r2: '', occ: '', obj: '', note: '', ocrOverride: false }; return v[no]; }
+function pv(s, no) { const v = s.verification.photos; if (!v[no]) v[no] = { mode: '', r1: '', r2: '', occ: '', obj: '', note: '' }; return v[no]; }
+
+// Wakil satu foto: bila ada angka terbaca penuh yang berbeda dari acuan → itu (mismatch terbukti);
+// bila ada yang tidak terbaca → itu; selain itu nilai pertama.
+function representative(list, refBatch) {
+  const vals = (list || []).map(x => String(x || '').replace(/\s/g, ''));
+  if (!vals.length) return '';
+  return vals.find(v => /^\d{8}$/.test(v) && v !== refBatch) || vals.find(v => !/^\d{8}$/.test(v)) || vals[0];
+}
+const elemOf = (read, group, key) => (read && read[group] && read[group][key]) || {};
+// Gabungkan status elemen dari semua foto; status per foto hanya dipakai bila pembacaan 1 dan 2 sama.
+function combineElement(s, group, aiKey) {
+  const per = s.photos.filter(p => p.ai && p.ai.status === 'selesai').map(p => {
+    const a = elemOf(p.ai.read1, group, aiKey), b = elemOf(p.ai.read2, group, aiKey);
+    const st = a.status && a.status === b.status ? a.status : STATUS.NOT_READABLE;
+    return { no: p.no, status: st, note: [a.terbaca, a.catatan].filter(Boolean).join(' — ') + (a.status !== b.status ? ` [bacaan 1: ${a.status || '-'}, bacaan 2: ${b.status || '-'}]` : '') };
+  });
+  const pick = st => per.find(x => x.status === st);
+  const order = [STATUS.MISMATCH, STATUS.MATCH, STATUS.NOT_READABLE, STATUS.NOT_APPLICABLE, STATUS.NOT_VISIBLE];
+  // MISMATCH terbukti mengalahkan semua; MATCH dipakai bila tidak ada MISMATCH; dst.
+  for (const st of order) {
+    const hit = pick(st);
+    if (!hit) continue;
+    return { status: st, photo: String(hit.no), note: hit.note };
+  }
+  return { status: STATUS.NOT_VISIBLE, photo: '', note: 'Tidak ada hasil AI' };
+}
+
+function fillVerificationFromAi(s) {
+  const v = s.verification = emptyVerification(s); const refBatch = s.refSnapshot.fields.batch;
+  for (const p of s.photos) {
+    const x = pv(s, p.no);
+    if (!p.ai || p.ai.status !== 'selesai') { Object.assign(x, { mode: 'failed', note: p.ai && p.ai.error || 'Analisis gagal' }); continue; }
+    const o1 = (p.ai.read1.batch_kemunculan || []).map(o => o.teks), o2 = (p.ai.read2.batch_kemunculan || []).map(o => o.teks);
+    if (!p.category && p.ai.read1.kategori) p.aiCategory = p.ai.read1.kategori;
+    if (!o1.length && !o2.length) { Object.assign(x, { mode: 'notvisible', note: 'AI: tidak ada nomor batch di foto ini' }); continue; }
+    Object.assign(x, { mode: 'visible', r1: representative(o1, refBatch) || '', r2: representative(o2, refBatch) || '',
+      occ: String(o1.length), obj: String(p.ai.read1.jumlah_objek_fisik ?? ''), occ2: String(o2.length), obj2: String(p.ai.read2.jumlah_objek_fisik ?? ''),
+      note: [p.ai.read1.catatan_hitungan, p.ai.read1.catatan_kualitas].filter(Boolean).join(' — ') });
+  }
+  IDENTITY.forEach(it => { v.identity[it.key] = combineElement(s, 'identitas', AI_KEYS.identity[it.key]); });
+  VISUAL.forEach(it => { v.visual[it.key] = { ...combineElement(s, 'visual', it.key), critical: true }; });
+}
+
+function finalizeResult(s) {
+  const r = computeResult(s);
+  s.result = r;
+  const failed = s.photos.filter(p => !p.ai || p.ai.status !== 'selesai').length;
+  setStage(2, failed ? 'GAGAL' : r.batch.status === STATUS.MATCH || r.batch.status === STATUS.MISMATCH ? 'TERBACA' : 'TIDAK TERBACA', r.batch.reason);
+  setStage(5, r.doubleCheck.every(x => x.consistent) && !r.findings.some(f => f.sev === 'PERLU TINJAU') ? 'SELESAI' : 'PERLU TINJAU');
+  setStage(6, 'SELESAI', r.decision);
+}
+
 const seg = (path, cur, opts) => `<div class="seg">${opts.map(([val, lab]) => `<button type="button" class="${cur === val ? 'on' : ''}" data-act="seg" data-path="${path}" data-v="${val}">${esc(lab)}</button>`).join('')}</div>`;
 const statusSeg = (path, cur) => seg(path, cur, ALL_STATUS.map(x => [x, x === STATUS.NOT_APPLICABLE ? 'N/A' : x]));
-const photoSelect = (path, cur, s) => `<select data-path="${path}"><option value="">— Foto bukti —</option>${s.photos.map(p => `<option value="${p.no}" ${String(cur) === String(p.no) ? 'selected' : ''}>${photoNo(p.no)} (${esc(p.category)})</option>`).join('')}</select>`;
+const photoSelect = (path, cur, s) => `<select data-path="${path}"><option value="">— Foto bukti —</option>${s.photos.map(p => `<option value="${p.no}" ${String(cur) === String(p.no) ? 'selected' : ''}>${photoNo(p.no)}</option>`).join('')}</select>`;
 
 routes.verifikasi = async () => {
   const s = S.session;
-  if (!ocrDone(s)) { go('proses'); return; }
-  if (!s.verification) s.verification = emptyVerification(s);
+  if (!s || !s.result) { go('proses'); return; }
   const v = s.verification; const ref = s.refSnapshot;
-  const allOcr = s.photos.map(p => (p.ocr && p.ocr.text) || '').join('\n');
   view.innerHTML = `
-  <h2>Verifikasi Petugas</h2><p class="sub">Isi sesuai yang benar-benar terlihat. Jangan menebak. Gunakan <b>?</b> untuk digit yang tidak terbaca.</p>
+  <h2>Tinjau &amp; Koreksi Hasil AI</h2><p class="sub">Ubah hanya bila Anda melihat AI salah. Setiap perubahan dicatat sebagai koreksi petugas. Gunakan <b>?</b> untuk digit yang tidak terbaca.</p>
   <div class="card"><h3>Batch Filling acuan</h3><div style="font:700 22px ui-monospace,monospace;letter-spacing:4px">${esc(ref.fields.batch)}</div></div>
   <div class="card"><h3>A. Batch Filling per foto</h3>
-  ${s.photos.map(p => { const x = pv(s, p.no); const cands = (p.ocr && p.ocr.candidates) || []; return `<div class="itm">
+  ${s.photos.map(p => { const x = pv(s, p.no); const occ = (p.ai && p.ai.read1 && p.ai.read1.batch_kemunculan) || []; return `<div class="itm">
     <div class="photo" style="padding:0;border:0"><img src="${url(p.blob)}" data-act="viewPhotoV" data-no="${p.no}" alt="">
-      <div><b>${photoNo(p.no)}</b> • ${esc(p.category)}<div class="meta">${esc(p.name)}</div>
-      <div class="hint">OCR: ${cands.length ? cands.map(esc).join(', ') : 'tidak menemukan angka 8 digit'}</div>
+      <div><b>${photoNo(p.no)}</b> • ${esc(p.category || p.aiCategory || '-')}<div class="meta">${esc(p.name)}</div>
+      <div class="hint">${occ.length ? 'AI: ' + occ.map(o => `${esc(o.teks)} (${esc(o.lokasi)}, ${esc(o.objek)}, yakin ${esc(o.yakin)})`).join('; ') : (x.mode === 'failed' ? 'Analisis gagal' : 'AI: tidak menemukan nomor batch')}</div>
       <button class="small sec" data-act="viewPhotoV" data-no="${p.no}" style="margin-top:4px">LIHAT + ZOOM</button></div></div>
-    <div class="hint" style="margin-top:6px">Apakah Batch Filling terlihat di foto ini?</div>
+    ${x.mode === 'failed' ? `<div class="msg bad" style="margin-top:6px">${esc(x.note)}</div>` : `
     ${seg(`photos.${p.no}.mode`, x.mode, [['visible', 'Terlihat'], ['notvisible', 'Tidak terlihat'], ['na', 'Tidak relevan']])}
     ${x.mode === 'visible' ? `
-      <label class="f">Pembacaan 1 (8 karakter)</label><input type="text" class="mono" maxlength="8" autocomplete="off" data-path="photos.${p.no}.r1" data-batch value="${esc(x.r1)}">
-      <label class="f">Pembacaan 2 — baca ulang dari foto, ketik lagi</label><input type="text" class="mono" maxlength="8" autocomplete="off" data-path="photos.${p.no}.r2" data-batch value="${esc(x.r2)}">
-      <div class="row"><div><label class="f">Jumlah kemunculan batch di foto</label><input type="number" min="0" inputmode="numeric" data-path="photos.${p.no}.occ" value="${esc(x.occ)}"></div>
-        <div><label class="f">Jumlah objek fisik berbeda</label><input type="number" min="0" inputmode="numeric" data-path="photos.${p.no}.obj" value="${esc(x.obj)}"></div></div>
-      <p class="hint">Pantulan atau cetakan ganda pada benda yang sama tidak dihitung sebagai objek tambahan.</p>
-      ${cands.length ? `<label class="check"><input type="checkbox" data-path="photos.${p.no}.ocrOverride" ${x.ocrOverride ? 'checked' : ''}> Jika OCR berbeda dari pembacaan saya: saya sudah memeriksa ulang dan OCR salah baca.</label>` : ''}` : ''}
-    <label class="f">Catatan</label><input type="text" data-path="photos.${p.no}.note" value="${esc(x.note)}">
+      <div class="row"><div><label class="f">Bacaan AI 1</label><input type="text" class="mono" maxlength="8" autocomplete="off" data-path="photos.${p.no}.r1" data-batch value="${esc(x.r1)}"></div>
+      <div><label class="f">Bacaan AI 2</label><input type="text" class="mono" maxlength="8" autocomplete="off" data-path="photos.${p.no}.r2" data-batch value="${esc(x.r2)}"></div></div>
+      <div class="row"><div><label class="f">Kemunculan</label><input type="number" min="0" inputmode="numeric" data-path="photos.${p.no}.occ" value="${esc(x.occ)}"></div>
+        <div><label class="f">Objek fisik</label><input type="number" min="0" inputmode="numeric" data-path="photos.${p.no}.obj" value="${esc(x.obj)}"></div></div>` : ''}
+    <label class="f">Catatan</label><input type="text" data-path="photos.${p.no}.note" value="${esc(x.note)}">`}
   </div>`; }).join('')}
   </div>
   <div class="card"><h3>B. Identitas produk</h3>
-  ${IDENTITY.map(it => { const x = v.identity[it.key]; const rv = it.ref(ref); const hit = rv ? s.photos.filter(p => p.ocr && textContains(p.ocr.text, rv)).map(p => photoNo(p.no)) : [];
-    return `<div class="itm"><b>${esc(it.name)}</b><div class="hint">Acuan: <b>${esc(rv || '(tidak tercantum di acuan)')}</b>${rv ? ` • Petunjuk OCR: ${hit.length ? 'ditemukan di ' + hit.join(', ') : 'tidak ditemukan otomatis'}` : ''}</div>
+  ${IDENTITY.map(it => { const x = v.identity[it.key]; const rv = it.ref(ref);
+    return `<div class="itm"><b>${esc(it.name)}</b><div class="hint">Acuan: <b>${esc(rv || '(tidak tercantum di acuan)')}</b></div>
     ${statusSeg(`identity.${it.key}.status`, x.status)}
     <div class="row" style="margin-top:6px">${photoSelect(`identity.${it.key}.photo`, x.photo, s)}<input type="text" placeholder="Catatan" data-path="identity.${it.key}.note" value="${esc(x.note)}"></div></div>`; }).join('')}
   </div>
@@ -595,26 +678,29 @@ routes.verifikasi = async () => {
     <label class="check"><input type="checkbox" data-path="visual.${it.key}.critical" ${x.critical ? 'checked' : ''}> Elemen kritis (MISMATCH → HOLD TOTAL)</label>
     <div class="row">${photoSelect(`visual.${it.key}.photo`, x.photo, s)}<input type="text" placeholder="Catatan" data-path="visual.${it.key}.note" value="${esc(x.note)}"></div></div>`; }).join('')}
   </div>
-  <div class="card"><h3>D. Petugas & tindak lanjut</h3>
-    <label class="f">Nama petugas QC</label><input type="text" data-path="officer" value="${esc(v.officer)}">
+  <div class="card"><h3>D. Tindak lanjut</h3>
     <label class="f">Temuan tambahan / tindak lanjut</label><textarea data-path="followUp">${esc(v.followUp)}</textarea>
   </div>
   <div id="verErr"></div>
-  <button class="full" data-act="buildReport">SIMPAN VERIFIKASI &amp; SUSUN LAPORAN</button>
-  ${allOcr.trim() ? `<details class="card" style="margin-top:12px"><summary>Teks OCR semua foto</summary><div class="ocrtext">${esc(allOcr)}</div></details>` : ''}`;
+  <button class="full" data-act="buildReport">SIMPAN KOREKSI &amp; HITUNG ULANG</button>`;
   view.querySelectorAll('[data-path]').forEach(el => {
     if (el.tagName === 'BUTTON') return;
     const ev = el.type === 'checkbox' || el.tagName === 'SELECT' ? 'change' : 'input';
     el.addEventListener(ev, () => {
       let val = el.type === 'checkbox' ? el.checked : el.value;
       if (el.dataset.batch !== undefined) { val = val.replace(/\s/g, ''); if (val !== el.value) el.value = val; }
-      setPath(s.verification, el.dataset.path, val); s.result = null; saveSoon(saveSession);
+      setPath(s.verification, el.dataset.path, val); markEdit(s, el.dataset.path, val); saveSoon(saveSession);
     });
   });
 };
+function markEdit(s, path, val) {
+  const e = s.verification.edits || (s.verification.edits = []);
+  const last = e[e.length - 1];
+  if (last && last.path === path) { last.to = val; last.at = new Date().toISOString(); } else e.push({ path, to: val, at: new Date().toISOString() });
+}
 actions.viewPhotoV = b => { const p = S.session.photos.find(x => x.no === +b.dataset.no); viewer(p.blob, photoNo(p.no)); };
 actions.seg = async b => {
-  const y = scrollY; setPath(S.session.verification, b.dataset.path, b.dataset.v); S.session.result = null;
+  const y = scrollY; setPath(S.session.verification, b.dataset.path, b.dataset.v); markEdit(S.session, b.dataset.path, b.dataset.v);
   await saveSession(); await render(); scrollTo(0, y);
 };
 
@@ -622,10 +708,10 @@ function verificationErrors(s) {
   const v = s.verification; const errs = [];
   s.photos.forEach(p => {
     const x = pv(s, p.no);
+    if (x.mode === 'failed') return;
     if (!x.mode) errs.push(`${photoNo(p.no)}: pilih apakah batch terlihat`);
     if (x.mode === 'visible') {
-      ['r1', 'r2'].forEach((k, i) => { if (!/^[0-9?]{8}$/.test(x[k] || '')) errs.push(`${photoNo(p.no)}: pembacaan ${i + 1} harus 8 karakter (angka atau ?)`); });
-      if (x.occ === '' || x.obj === '') errs.push(`${photoNo(p.no)}: isi jumlah kemunculan & objek fisik`);
+      ['r1', 'r2'].forEach((k, i) => { if (!/^[0-9?]{8}$/.test(x[k] || '')) errs.push(`${photoNo(p.no)}: bacaan ${i + 1} harus 8 karakter (angka atau ?)`); });
     }
   });
   IDENTITY.forEach(it => { if (!v.identity[it.key].status) errs.push(`Identitas "${it.name}": pilih status`); });
@@ -636,11 +722,13 @@ function verificationErrors(s) {
 // ---------- susun hasil (keputusan dihitung oleh qc-core) ----------
 function computeResult(s) {
   const v = s.verification; const ref = s.refSnapshot; const refBatch = ref.fields.batch;
-  const perPhoto = []; const dc = []; const unresolved = [];
+  const perPhoto = []; const dc = []; const review = [];
   for (const p of s.photos) {
-    const x = pv(s, p.no); const cands = (p.ocr && p.ocr.candidates) || [];
-    const row = { no: p.no, category: p.category, mode: x.mode, r1: x.r1, r2: x.r2, ocr: cands, occ: x.occ, obj: x.obj, note: x.note };
-    if (x.mode === 'na') { row.status = STATUS.NOT_APPLICABLE; row.reason = 'Batch tidak relevan untuk foto ini'; }
+    const x = pv(s, p.no);
+    const row = { no: p.no, category: p.category || p.aiCategory || '', mode: x.mode, r1: x.r1, r2: x.r2, occ: x.occ, obj: x.obj, note: x.note,
+      occurrences: (p.ai && p.ai.read1 && p.ai.read1.batch_kemunculan) || [] };
+    if (x.mode === 'failed') { row.status = STATUS.NOT_READABLE; row.reason = 'Analisis foto gagal: ' + x.note; }
+    else if (x.mode === 'na') { row.status = STATUS.NOT_APPLICABLE; row.reason = 'Batch tidak relevan untuk foto ini'; }
     else if (x.mode === 'notvisible') { row.status = STATUS.NOT_VISIBLE; row.reason = 'Batch tidak terlihat'; }
     else {
       const rc = reconcileReadings(x.r1, x.r2);
@@ -652,21 +740,16 @@ function computeResult(s) {
         const cmp = compareBatch(refBatch, rc.value);
         Object.assign(row, { value: rc.value, status: cmp.status, reason: cmp.reason, positions: cmp.positions });
       }
-      let ocrNote = 'OCR tidak menemukan angka 8 digit (tidak memengaruhi keputusan)';
-      if (cands.length && row.value) {
-        if (cands.includes(row.value)) ocrNote = 'OCR sesuai dengan pembacaan petugas';
-        else if (x.ocrOverride) ocrNote = `OCR membaca ${cands.join(', ')}; petugas menyatakan OCR salah baca setelah cek ulang`;
-        else { ocrNote = `OCR membaca ${cands.join(', ')} — BERBEDA dari petugas (${row.value}); perlu tinjau`; unresolved.push(`${photoNo(p.no)}: OCR berbeda dari pembacaan petugas`); }
-      }
-      row.ocrNote = ocrNote;
-      dc.push({ no: p.no, first: x.r1, second: x.r2, consistent: rc.consistent, ocrNote });
+      let cnote = '';
+      if (x.occ2 !== undefined && (x.occ2 !== x.occ || x.obj2 !== x.obj)) { cnote = `Hitungan bacaan 1: ${x.occ} kemunculan/${x.obj} objek; bacaan 2: ${x.occ2}/${x.obj2}`; review.push(`${photoNo(p.no)}: hitungan kemunculan berbeda antar bacaan`); }
+      dc.push({ no: p.no, first: x.r1, second: x.r2, consistent: rc.consistent, note: cnote || 'Hitungan konsisten' });
     }
     perPhoto.push(row);
   }
   const batchStatus = aggregateBatch(perPhoto);
   const show = perPhoto.find(r => r.status === STATUS.MISMATCH) || perPhoto.find(r => r.status === STATUS.NOT_READABLE && r.positions) || perPhoto.find(r => r.status === STATUS.MATCH);
   const actualDisplay = show ? (show.value || [show.r1, show.r2].join(' / ')) : '-';
-  const batchReason = show ? show.reason : 'Batch Filling tidak terlihat pada foto mana pun';
+  const batchReason = show ? show.reason : (perPhoto.find(r => r.mode === 'failed') ? 'Ada foto yang gagal dianalisis' : 'Batch Filling tidak terlihat pada foto mana pun');
 
   const identity = IDENTITY.map(it => { const x = v.identity[it.key]; const rv = it.ref(ref);
     return { key: it.key, name: it.name, ref: rv || '', status: x.status, photo: x.photo, note: x.note, required: true, critical: true }; });
@@ -674,22 +757,23 @@ function computeResult(s) {
 
   const elements = [{ name: 'Batch Filling', status: batchStatus, required: true, critical: true, note: batchReason },
     ...identity.map(e => ({ ...e, name: 'Identitas: ' + e.name })), ...visual.map(e => ({ ...e, name: 'Visual: ' + e.name }))];
-  const ocrFailed = s.photos.filter(p => !p.ocr || p.ocr.status !== 'selesai').length;
+  const failed = s.photos.filter(p => !p.ai || p.ai.status !== 'selesai').length;
   const fileBad = s.photos.filter(p => p.status !== 'Siap').length;
-  const meta = { referenceLocked: !!(S.ref && S.ref.id === s.refId), photosTotal: s.photos.length, photosFailed: ocrFailed + fileBad,
-    analysisComplete: verificationErrors(s).length === 0 && unresolved.length === 0 };
+  const meta = { referenceLocked: !!(S.ref && S.ref.id === s.refId), photosTotal: s.photos.length, photosFailed: failed + fileBad,
+    analysisComplete: verificationErrors(s).length === 0 && failed === 0 };
   const d = decide(elements, meta);
-  if (unresolved.length) d.reasons.push(...unresolved);
 
-  const counts = perPhoto.map(r => ({ no: r.no, ocrCount: r.ocr.length, occ: r.occ, obj: r.obj, value: r.value || '' }));
+  const counts = perPhoto.map(r => ({ no: r.no, occ: r.occ, obj: r.obj, value: r.value || '', occurrences: r.occurrences }));
   const findings = [];
   for (const e of elements) {
     if (e.status === STATUS.MATCH || e.status === STATUS.NOT_APPLICABLE) continue;
     if (e.status === STATUS.MISMATCH) findings.push({ sev: e.critical ? 'KRITIS' : 'NON-KRITIS', text: `${e.name}: MISMATCH${e.note ? ' — ' + e.note : ''}`, action: e.critical ? 'Tahan/karantina batch; investigasi sumber ketidaksesuaian' : 'Catat dan tinjau oleh supervisor' });
-    else findings.push({ sev: 'BUKTI KURANG', text: `${e.name}: ${e.status}${e.note ? ' — ' + e.note : ''}`, action: e.status === STATUS.NOT_VISIBLE ? 'Tambahkan foto yang memperlihatkan elemen ini' : 'Ambil foto close-up ulang dengan pencahayaan lebih baik' });
+    else findings.push({ sev: 'BUKTI KURANG', text: `${e.name}: ${e.status}${e.note ? ' — ' + e.note : ''}`, action: e.status === STATUS.NOT_VISIBLE ? 'Tambahkan foto yang memperlihatkan elemen ini, atau tandai N/A bila memang tidak relevan' : 'Ambil foto close-up ulang dengan pencahayaan lebih baik' });
   }
-  unresolved.forEach(u => findings.push({ sev: 'PERLU TINJAU', text: u, action: 'Baca ulang foto; konfirmasi bila OCR salah baca' }));
-  return { ...d, computedAt: new Date().toISOString(), meta,
+  review.forEach(u => findings.push({ sev: 'PERLU TINJAU', text: u, action: 'Periksa foto; koreksi hitungan bila perlu' }));
+  (s.photos || []).forEach(p => (p.ai && p.ai.read1 && p.ai.read1.temuan || []).forEach(t => findings.push({ sev: 'CATATAN AI', text: `${photoNo(p.no)}: ${t}`, action: 'Tinjau oleh petugas' })));
+  return { ...d, computedAt: new Date().toISOString(), meta, model: (s.photos.find(p => p.ai && p.ai.model) || {}).ai?.model || '',
+    edits: (v.edits || []).length,
     batch: { ref: refBatch, actual: actualDisplay, status: batchStatus, reason: batchReason, positions: show && show.positions ? show.positions : [], perPhoto },
     identity, visual, counts, doubleCheck: dc, findings,
     totals: { occ: counts.reduce((a, c) => a + (+c.occ || 0), 0), obj: counts.reduce((a, c) => a + (+c.obj || 0), 0), unique: [...new Set(perPhoto.filter(r => r.value).map(r => r.value))] } };
@@ -699,13 +783,8 @@ actions.buildReport = async () => {
   const s = S.session; const errs = verificationErrors(s);
   const box = document.getElementById('verErr');
   if (errs.length) { box.innerHTML = `<div class="msg bad"><b>Belum lengkap (${errs.length}):</b><br>${errs.slice(0, 12).map(esc).join('<br>')}</div>`; box.scrollIntoView({ behavior: 'smooth' }); return; }
-  const r = computeResult(s);
-  s.result = r;
-  setStage(2, r.batch.status === STATUS.MATCH || r.batch.status === STATUS.MISMATCH ? 'TERBACA' : 'TIDAK TERBACA', r.batch.reason);
-  setStage(3, 'SELESAI'); setStage(4, 'SELESAI');
-  setStage(5, r.doubleCheck.every(x => x.consistent) && !r.findings.some(f => f.sev === 'PERLU TINJAU') ? 'SELESAI' : 'PERLU TINJAU');
-  setStage(6, 'SELESAI', r.decision);
-  await saveSession(); await db.audit('LAPORAN_DISUSUN', { id: s.id, decision: r.decision });
+  finalizeResult(s);
+  await saveSession(); await db.audit('HASIL_DIHITUNG_ULANG', { id: s.id, decision: s.result.decision, edits: (s.verification.edits || []).length });
   go('hasil');
 };
 
@@ -736,6 +815,8 @@ function reportSections(s, open = false) {
       ${s.finalizedAt ? `<span>Diselesaikan</span><b>${fmtTime(s.finalizedAt)}</b>` : ''}
       <span>Produk</span><b>${esc([f.brand, f.produk].filter(Boolean).join(' '))}</b><span>Varian</span><b>${esc(f.varian || '-')}</b>
       <span>Volume</span><b>${esc(f.volume || '-')}</b><span>Petugas</span><b>${esc(s.verification.officer || '-')}</b>
+      <span>Model AI</span><b>${esc(r.model || '-')}</b><span>Biaya AI sesi</span><b>${s.usage ? fmtCost(s.usage.cost_usd) + ' • ' + s.usage.calls + ' permintaan' : '-'}</b>
+      <span>Koreksi petugas</span><b>${r.edits ? r.edits + ' perubahan' : 'tidak ada'}</b>
       ${s.revisionNote ? `<span>Alasan revisi</span><b>${esc(s.revisionNote)}</b>` : ''}</div>`),
     sec('B. Referensi terkunci', `<img class="preview" src="${url(ref.image)}" alt="DATA ACUAN"><div class="kv" style="margin-top:8px">
       <span>ID acuan</span><b>${esc(ref.id)}</b><span>Waktu lock</span><b>${fmtTime(ref.lockedAt)}</b><span>Batch Filling</span><b style="font-family:monospace">${esc(f.batch)}</b>
@@ -744,13 +825,13 @@ function reportSections(s, open = false) {
     sec('D. Batch Filling', `<div class="kv"><span>Acuan</span><b style="font-family:monospace">${esc(r.batch.ref)}</b><span>Aktual</span><b style="font-family:monospace">${esc(r.batch.actual)}</b><span>Status</span><b>${badge(r.batch.status)}</b></div>
       <div class="hint">${esc(r.batch.reason)}</div>${digitsHtml(r.batch)}
       <div style="margin-top:10px">${tbl(['Foto', 'Bacaan', 'Status', 'Keterangan'], r.batch.perPhoto.map(x => `<tr><td>${ph(x.no)}</td><td style="font-family:monospace">${esc(x.value || (x.mode === 'visible' ? x.r1 + ' / ' + x.r2 : '-'))}</td><td>${badge(x.status)}</td><td>${esc(x.reason)}</td></tr>`))}</div>`),
-    sec('E. Pemeriksaan foto', `${tbl(['Foto', 'Kategori', 'File', 'OCR'], s.photos.map(p => `<tr><td>${ph(p.no)}</td><td>${esc(p.category)}</td><td>${esc(p.name)}<br><span class="hint">${fmtSize(p.size)}</span></td><td>${p.ocr ? esc(p.ocr.status) : '-'}</td></tr>`))}
+    sec('E. Pemeriksaan foto', `${tbl(['Foto', 'Kategori', 'File', 'Kualitas', 'Status AI'], s.photos.map(p => `<tr><td>${ph(p.no)}</td><td>${esc(p.category || p.aiCategory || '-')}${p.category ? ' <span class="hint">(petugas)</span>' : ''}</td><td>${esc(p.name)}<br><span class="hint">${fmtSize(p.size)}</span></td><td>${esc(p.ai && p.ai.read1 ? p.ai.read1.kualitas + (p.ai.read1.catatan_kualitas ? ' — ' + p.ai.read1.catatan_kualitas : '') : '-')}</td><td>${p.ai ? esc(p.ai.status) + (p.ai.error ? ': ' + esc(p.ai.error) : '') : '-'}</td></tr>`))}
       <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-top:8px">${s.photos.map(p => `<figure style="margin:0"><img src="${url(p.blob)}" style="width:100%;border-radius:6px" alt=""><figcaption class="hint">${ph(p.no)}</figcaption></figure>`).join('')}</div>
       <div style="margin-top:8px">${tbl(['Elemen visual', 'Status', 'Kritis', 'Bukti', 'Catatan'], r.visual.map(e => `<tr><td>${esc(e.name)}</td><td>${badge(e.status)}</td><td>${e.critical ? 'Ya' : 'Tidak'}</td><td>${ph(e.photo)}</td><td>${esc(e.note)}</td></tr>`))}</div>`),
-    sec('F. Hitungan batch', `${tbl(['Foto', 'Kemunculan (petugas)', 'Objek fisik', 'Kandidat OCR', 'Nilai'], r.counts.map(c => `<tr><td>${ph(c.no)}</td><td>${esc(c.occ || '-')}</td><td>${esc(c.obj || '-')}</td><td>${c.ocrCount}</td><td style="font-family:monospace">${esc(c.value || '-')}</td></tr>`))}
+    sec('F. Hitungan batch', `${tbl(['Foto', 'Kemunculan', 'Objek fisik', 'Nilai', 'Rincian'], r.counts.map(c => `<tr><td>${ph(c.no)}</td><td>${esc(c.occ || '-')}</td><td>${esc(c.obj || '-')}</td><td style="font-family:monospace">${esc(c.value || '-')}</td><td>${(c.occurrences || []).map(o => `${esc(o.teks)} — ${esc(o.lokasi)}, ${esc(o.objek)}`).join('<br>') || '-'}</td></tr>`))}
       <div class="kv" style="margin-top:8px"><span>Total kemunculan</span><b>${r.totals.occ}</b><span>Total objek fisik</span><b>${r.totals.obj}</b><span>Nilai unik</span><b style="font-family:monospace">${esc(r.totals.unique.join(', ') || '-')}</b></div>
-      <p class="hint">Keterbatasan: hitungan berdasarkan pengamatan petugas pada foto; pantulan/duplikat pada benda yang sama tidak dihitung sebagai objek tambahan. OCR tidak andal untuk angka emboss.</p>`),
-    sec('G. Double check', r.doubleCheck.length ? tbl(['Foto', 'Bacaan 1', 'Bacaan 2', 'Konsisten', 'OCR'], r.doubleCheck.map(x => `<tr><td>${ph(x.no)}</td><td style="font-family:monospace">${esc(x.first)}</td><td style="font-family:monospace">${esc(x.second)}</td><td>${x.consistent ? badge('YA') : badge('TIDAK')}</td><td>${esc(x.ocrNote)}</td></tr>`)) : '<div class="hint">Tidak ada pembacaan batch.</div>'),
+      <p class="hint">Keterbatasan: Hitungan dari AI (bacaan 1) dan dapat dikoreksi petugas; pantulan/duplikat pada benda yang sama tidak dihitung sebagai objek tambahan.</p>`),
+    sec('G. Double check', r.doubleCheck.length ? tbl(['Foto', 'Bacaan 1', 'Bacaan 2', 'Konsisten', 'Catatan'], r.doubleCheck.map(x => `<tr><td>${ph(x.no)}</td><td style="font-family:monospace">${esc(x.first)}</td><td style="font-family:monospace">${esc(x.second)}</td><td>${x.consistent ? badge('YA') : badge('TIDAK')}</td><td>${esc(x.note)}</td></tr>`)) : '<div class="hint">Tidak ada pembacaan batch.</div>'),
     sec('H. Temuan QC & tindak lanjut', `${r.findings.length ? tbl(['Tingkat', 'Temuan', 'Tindak lanjut'], r.findings.map(x => `<tr><td>${badge(x.sev)}</td><td>${esc(x.text)}</td><td>${esc(x.action)}</td></tr>`)) : '<div class="hint">Tidak ada temuan.</div>'}
       ${s.verification.followUp ? `<p><b>Catatan petugas:</b> ${esc(s.verification.followUp)}</p>` : ''}`),
     sec('I. Keputusan akhir', `${decisionHtml(r)}<div class="kv"><span>Petugas QC</span><b>${esc(s.verification.officer || '-')}</b>
@@ -765,11 +846,12 @@ routes.hasil = async () => {
   const r = s.result;
   view.innerHTML = `<h2>Hasil Pemeriksaan</h2><p class="sub">${esc(s.id)} • ${fmtTime(r.computedAt)} • belum diselesaikan</p>
   ${decisionHtml(r)}
+  <div class="msg info">Dibaca oleh AI (${esc(r.model || '-')}), masing-masing foto 2x. ${r.edits ? `<b>${r.edits} koreksi petugas</b>.` : 'Belum ada koreksi petugas.'} Biaya sesi: ${s.usage ? fmtCost(s.usage.cost_usd) : '-'}.</div>
   <div class="card"><h3>Batch Filling</h3><div class="kv"><span>Acuan</span><b style="font-family:monospace">${esc(r.batch.ref)}</b><span>Aktual</span><b style="font-family:monospace">${esc(r.batch.actual)}</b><span>Status</span><b>${badge(r.batch.status)}</b></div>${digitsHtml(r.batch)}</div>
   <div class="card"><h3>Identitas produk</h3>${r.identity.map(e => `<div class="srow" style="padding:3px 0"><span>${esc(e.name)}</span>${badge(e.status)}</div>`).join('')}</div>
   <div class="card"><h3>Tindakan</h3>
     <div class="row"><button class="sec" data-act="toggleDetail">DETAIL HASIL</button><button class="sec" data-act="exportPdf" data-k="${esc(s.key)}">EKSPOR PDF</button></div>
-    <div class="row" style="margin-top:8px"><button class="sec" data-act="goto" data-h="verifikasi">UBAH VERIFIKASI</button><button class="sec" data-act="redo">ULANGI ANALISIS</button></div>
+    <div class="row" style="margin-top:8px"><button class="sec" data-act="goto" data-h="verifikasi">TINJAU / KOREKSI</button><button class="sec" data-act="redo">ULANGI ANALISIS</button></div>
     <label class="f">Nama petugas QC yang menyetujui *</label><input type="text" id="approver" value="${esc(s.verification.officer || '')}">
     <label class="check"><input type="checkbox" id="approveChk"> Saya telah meninjau seluruh bukti dan menyetujui keputusan <b>${esc(r.decision)}</b>.</label>
     <button class="full" data-act="finish" id="btnFinish" disabled>SELESAI &amp; SIMPAN KE RIWAYAT</button>
@@ -781,7 +863,7 @@ routes.hasil = async () => {
 };
 actions.toggleDetail = () => { const d = document.getElementById('detail'); d.classList.toggle('hidden'); if (!d.classList.contains('hidden')) { d.querySelectorAll('details').forEach(x => { x.open = true; }); d.scrollIntoView({ behavior: 'smooth' }); } };
 actions.redo = async () => {
-  if (!await modal({ title: 'Ulangi analisis?', body: '<p>Pembacaan OCR akan diulang dan hasil saat ini dihapus. Isian verifikasi petugas tetap disimpan. Proses berjalan di perangkat (tanpa biaya API).</p>', ok: 'Ulangi' })) return;
+  if (!await modal({ title: 'Ulangi analisis?', body: '<p>Semua foto akan dikirim ulang ke AI dan hasil serta koreksi saat ini dihapus. Ini memakai kuota/biaya API lagi.</p>', ok: 'Ulangi' })) return;
   await actions.startAnalysis();
 };
 actions.finish = async () => {
@@ -875,31 +957,50 @@ routes.setelan = async () => {
   try { est = await navigator.storage.estimate(); persisted = await navigator.storage.persisted(); } catch {}
   const sessions = await db.all('sessions'); const refs = await db.all('refs');
   const audit = (await db.all('audit')).slice(-15).reverse();
+  const usage = (await db.kvGet('usageTotal')) || { input_tokens: 0, output_tokens: 0, cost_usd: 0, calls: 0 };
   view.innerHTML = `<h2>Pengaturan</h2><p class="sub">Informasi layanan dan privasi</p>
   <div class="card"><h3>Status aplikasi</h3><div class="kv"><span>Versi aplikasi</span><b>${APP_VERSION}</b>
-    <span>Backend</span><b>Tidak digunakan (semua proses di perangkat)</b><span>Internet</span><b>${navigator.onLine ? badge('ONLINE') : badge('OFFLINE')}</b>
-    <span>Modul OCR</span><b>${window.Tesseract ? 'Sudah dimuat' : 'Dimuat saat dibutuhkan'}</b></div></div>
+    <span>Backend</span><b>${!apiBase() ? badge('BELUM DIATUR') : S_ai.status === 'ok' ? badge('AKTIF') : S_ai.status === 'error' ? badge('GAGAL') : badge('BELUM DICEK')}</b>
+    <span>Internet</span><b>${navigator.onLine ? badge('ONLINE') : badge('OFFLINE')}</b></div>
+    ${S_ai.status === 'error' ? `<div class="msg bad" style="margin-top:8px">${esc(S_ai.error)}</div>` : ''}</div>
+  <div class="card"><h3>Informasi API</h3><div class="kv"><span>Koneksi</span><b>${S_ai.status === 'ok' ? badge('AKTIF') : S_ai.status === 'error' ? badge('ERROR') : '-'}</b>
+    <span>Server</span><b style="word-break:break-all">${esc(apiBase() || '(belum diatur)')}</b><span>Model AI</span><b>${esc(S_ai.model || '-')}</b>
+    <span>API key</span><b>Tersimpan di server, tidak pernah ditampilkan</b></div>
+    <label class="f">Kode akses aplikasi</label><input type="text" id="passIn" autocomplete="off" placeholder="${getPasscode() ? '•••••••• (tersimpan)' : 'Masukkan kode akses'}">
+    <div class="row" style="margin-top:8px"><button data-act="savePass">SIMPAN &amp; TES KONEKSI</button>${getPasscode() ? '<button class="sec" data-act="clearPass">HAPUS KODE</button>' : ''}</div>
+    <p class="hint">Kode akses mencegah orang lain memakai server AI Anda. Ini bukan API key.</p></div>
+  <div class="card"><h3>Biaya AI</h3><div class="kv"><span>Total permintaan</span><b>${usage.calls}</b><span>Token masuk / keluar</span><b>${usage.input_tokens.toLocaleString('id-ID')} / ${usage.output_tokens.toLocaleString('id-ID')}</b>
+    <span>Estimasi biaya total</span><b>${fmtCost(usage.cost_usd)}</b><span>Tarif dipakai</span><b>${S_ai.price ? `$${S_ai.price.in} / $${S_ai.price.out} per 1 juta token (masuk/keluar)` : '-'}</b></div>
+    <p class="hint">Estimasi dari jumlah token. Tagihan resmi ada di console Anthropic. Hosting (GitHub Pages & Cloudflare Workers paket gratis) Rp0.</p></div>
+  <div class="card"><h3>Privasi & data</h3><div class="kv"><span>Gambar dikirim ke AI?</span><b>YA, saat Anda menekan BACA/ANALISIS dan menyetujui</b>
+    <span>Penyedia AI</span><b>Anthropic (Claude API)</b><span>Data dikirim</span><b>Foto (diperkecil maks 1568 px) + identitas produk acuan. Nomor batch acuan TIDAK dikirim.</b>
+    <span>Tujuan</span><b>Membaca teks/angka & memeriksa visual untuk QC</b>
+    <span>Server aplikasi</span><b>Hanya meneruskan; tidak menyimpan foto</b><span>Retensi di Anthropic</span><b>Sesuai kebijakan data API Anthropic</b></div></div>
   <div class="card"><h3>Penyimpanan</h3><div class="kv"><span>Mode</span><b>Lokal (IndexedDB di Chrome)</b>
     <span>Terpakai</span><b>${est ? fmtSize(est.usage || 0) : '-'}</b><span>Penyimpanan permanen</span><b>${persisted ? badge('AKTIF') : badge('BELUM')}</b>
     <span>Sesi tersimpan</span><b>${sessions.filter(s => s.status === 'final').length}</b><span>Acuan tersimpan</span><b>${refs.length}</b>
     <span>Sinkronisasi cloud</span><b>Tidak ada</b></div>
-    <p class="hint">Data disimpan sampai Anda menghapusnya. Data hilang bila data situs Chrome dihapus, aplikasi di-uninstall, atau HP rusak/diganti. Pemulihan hanya dari file cadangan.</p>
+    <p class="hint">Riwayat, foto, dan acuan disimpan di HP sampai Anda menghapusnya. Data hilang bila data situs Chrome dihapus, aplikasi di-uninstall, atau HP rusak/diganti. Pemulihan hanya dari file cadangan.</p>
     ${!persisted ? '<button class="full sec" data-act="persist">MINTA PENYIMPANAN PERMANEN</button>' : ''}
     <div class="row" style="margin-top:8px"><button data-act="backup">EKSPOR CADANGAN</button><button class="sec" data-act="restore">PULIHKAN CADANGAN</button></div>
     <input type="file" id="restoreFile" accept="application/json,.json" class="hidden"></div>
-  <div class="card"><h3>Privasi & data</h3><div class="kv"><span>Gambar dikirim ke AI?</span><b>TIDAK</b>
-    <span>Pembaca teks</span><b>Tesseract OCR (open-source), berjalan di HP</b><span>Diunduh dari internet</span><b>Kode OCR & data bahasa (cdn.jsdelivr.net), bukan foto</b>
-    <span>Data dikirim</span><b>Tidak ada</b><span>Biaya</span><b>Rp0 (tanpa API berbayar)</b></div></div>
-  <div class="card"><h3>Informasi API</h3><div class="kv"><span>Koneksi API</span><b>Tidak digunakan</b><span>API key</span><b>Tidak ada di aplikasi ini</b></div></div>
   <div class="card"><h3>Aturan keputusan (terkunci)</h3>
     <div class="kv"><span>${badge('RELEASE')}</span><b>Semua elemen wajib yang relevan terbaca, terverifikasi, dan sesuai.</b>
     <span>${badge('HOLD')}</span><b>Bukti kritis tidak terbaca, tidak terlihat, ambigu, atau analisis belum lengkap.</b>
     <span>${badge('HOLD TOTAL')}</span><b>Ketidaksesuaian kritis terbukti, termasuk Batch Filling berbeda.</b></div>
-    <p class="hint">Aturan tertanam di kode dan tidak dapat diubah dari aplikasi.</p></div>
+    <p class="hint">Aturan tertanam di kode dan tidak dapat diubah dari aplikasi. AI hanya membaca; keputusan dihitung oleh aturan ini.</p></div>
   <div class="card"><h3>Log audit (terbaru)</h3>${audit.length ? audit.map(a => `<div class="itm"><b>${esc(a.event)}</b> <span class="hint">${fmtTime(a.at)}</span><div class="hint">${esc(JSON.stringify(a.detail))}</div></div>`).join('') : '<div class="empty">Belum ada aktivitas.</div>'}</div>
-  <div class="card"><h3>Tentang aplikasi</h3><p style="font-size:14px">QC BATCH RELEASE adalah alat bantu inspeksi. OCR membantu membaca teks cetak (tabel, label) tetapi <b>tidak andal untuk angka emboss</b>; pembacaan emboss dilakukan petugas dua kali. Aplikasi tidak menebak karakter. Petugas QC memegang otoritas persetujuan akhir.</p>
+  <div class="card"><h3>Tentang aplikasi</h3><p style="font-size:14px">QC BATCH RELEASE adalah alat bantu inspeksi. AI dapat salah membaca angka yang blur, emboss bertekstur rendah, pantulan cahaya, atau objek yang tumpang tindih. Karena itu setiap foto dibaca 2 kali, digit yang ragu ditandai "?", dan keraguan selalu menghasilkan HOLD. Petugas QC meninjau dan memegang otoritas persetujuan akhir.</p>
     <button class="full danger" data-act="wipe">HAPUS SEMUA DATA</button></div>`;
 };
+actions.savePass = async () => {
+  const v = document.getElementById('passIn').value.trim();
+  if (v) setPasscode(v);
+  if (!getPasscode()) { toast('Isi kode akses dulu.', 'bad'); return; }
+  S_ai.status = 'unknown'; await checkAi();
+  toast(S_ai.status === 'ok' ? 'Terhubung ke server AI.' : 'Gagal: ' + S_ai.error, S_ai.status === 'ok' ? 'ok' : 'bad'); render();
+};
+actions.clearPass = async () => { setPasscode(''); S_ai.status = 'unknown'; toast('Kode akses dihapus dari HP ini.'); render(); };
 actions.persist = async () => { try { const ok = await navigator.storage.persist(); toast(ok ? 'Penyimpanan permanen aktif.' : 'Chrome menolak permintaan. Pasang aplikasi ke layar utama lalu coba lagi.', ok ? 'ok' : 'bad'); } catch { toast('Tidak didukung.', 'bad'); } render(); };
 const b64 = blob => new Promise(r => { const fr = new FileReader(); fr.onload = () => r(fr.result); fr.readAsDataURL(blob); });
 const unb64 = async d => (await fetch(d)).blob();
@@ -934,7 +1035,7 @@ actions.wipe = async () => {
 // ================= start =================
 (async () => {
   try { await loadState(); } catch (e) { view.innerHTML = `<div class="msg bad">Penyimpanan perangkat tidak tersedia: ${esc(e.message)}. Pastikan tidak memakai mode Samaran (Incognito).</div>`; return; }
-  render();
+  render(); checkAi();
   if ('serviceWorker' in navigator && location.protocol === 'https:') navigator.serviceWorker.register('sw.js').catch(() => {});
 })();
 window.__QC = { S, computeResult };
